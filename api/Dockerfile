@@ -8,7 +8,7 @@ RUN apt-get update \
 
 COPY api ./api
 
-RUN pip install --no-cache-dir ./api
+RUN pip install --no-cache-dir "./api[dev]"
 
 EXPOSE 8000
 

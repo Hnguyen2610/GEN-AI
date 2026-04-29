@@ -9,6 +9,6 @@ RUN apt-get update \
 COPY worker ./worker
 COPY api ./api
 
-RUN pip install --no-cache-dir ./api ./worker
+RUN pip install --no-cache-dir "./api[dev]" "./worker[dev]"
 
 CMD ["python", "-m", "worker.app.main"]

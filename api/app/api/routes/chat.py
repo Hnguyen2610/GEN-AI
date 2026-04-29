@@ -17,6 +17,7 @@ class CreateSessionRequest(BaseModel):
     title: str
 
 class ChatMessageRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
     content: str
     model_choice: str = "llama3.2:1b"
 
@@ -47,6 +48,18 @@ async def get_chat_session(
         raise HTTPException(status_code=404, detail="Session not found")
     return session
 
+
+@router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat_session(
+    session_id: uuid.UUID,
+    user: AuthenticatedUser = Depends(get_current_user),
+    service: ChatService = Depends(get_chat_service),
+):
+    deleted = await service.delete_session(user, session_id=session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return None
+
 @router.post("/{session_id}/messages")
 async def create_chat_message(
     session_id: uuid.UUID,
@@ -71,6 +84,8 @@ async def create_chat_message(
         except ValueError as ve:
             yield f"event: error\ndata: {json.dumps(str(ve))}\n\n"
         except Exception as e:
-            yield f"event: error\ndata: {json.dumps('Internal server error during streaming.')}\n\n"
+            import logging
+            logging.getLogger(__name__).exception("Streaming error")
+            yield f"event: error\ndata: {json.dumps(f'Internal server error: {str(e)}')}\n\n"
 
     return StreamingResponse(sse_stream(), media_type="text/event-stream")

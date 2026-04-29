@@ -189,6 +189,8 @@ export type ChatMessage = {
   role: "user" | "assistant";
   content: string;
   status: "streaming" | "completed" | "failed";
+  model_name?: string | null;
+  retrieval_used?: boolean;
   metadata_json: any;
   created_at: string;
 };
@@ -217,6 +219,12 @@ export async function createChatSession(title: string) {
 export async function getChatSession(sessionId: string) {
   const response = await apiFetch(`/v1/chat/sessions/${sessionId}`);
   return (await response.json()) as ChatSession;
+}
+
+export async function deleteChatSession(sessionId: string) {
+  await apiFetch(`/v1/chat/sessions/${sessionId}`, {
+    method: "DELETE",
+  });
 }
 
 export type KnowledgeListItem = {

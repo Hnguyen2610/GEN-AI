@@ -67,6 +67,30 @@ def test_tabular_parser_excel(temp_storage):
     
     parser.delete_materialization(workspace_id, dataset_id)
 
+
+def test_tabular_parser_excel_mixed_type_column(temp_storage):
+    parser = TabularParser(storage_root=temp_storage)
+    workspace_id = uuid4()
+    dataset_id = uuid4()
+    version_id = uuid4()
+
+    xlsx_path = os.path.join(temp_storage, "mixed.xlsx")
+    with pd.ExcelWriter(xlsx_path) as writer:
+        pd.DataFrame({"mixed": [1, "two", None], "value": [10, 20, 30]}).to_excel(
+            writer, sheet_name="Sheet1", index=False
+        )
+
+    sheets, profiles = parser.parse_and_materialize(
+        xlsx_path, workspace_id, dataset_id, version_id
+    )
+
+    assert len(sheets) == 1
+    mixed_profile = next(profile for profile in profiles if profile.column_name == "mixed")
+    assert mixed_profile.sample_values == {"values": ["1", "two"]}
+    assert mixed_profile.min_value is not None or mixed_profile.max_value is not None
+
+    parser.delete_materialization(workspace_id, dataset_id)
+
 def test_knowledge_parser_docx_table_only(temp_storage):
     from docx import Document
 

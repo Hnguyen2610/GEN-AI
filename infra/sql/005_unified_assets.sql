@@ -8,6 +8,15 @@ BEGIN
 END $$;
 --;;
 
+-- 1b. Create DatasetStatus Enum for unified asset status
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'dataset_status') THEN
+        CREATE TYPE dataset_status AS ENUM ('pending', 'processing', 'ready', 'failed');
+    END IF;
+END $$;
+--;;
+
 -- 2. Create assets table
 CREATE TABLE IF NOT EXISTS assets (
     id UUID PRIMARY KEY,
@@ -16,7 +25,7 @@ CREATE TABLE IF NOT EXISTS assets (
     title VARCHAR(255) NOT NULL,
     original_filename VARCHAR(512) NOT NULL,
     mime_type VARCHAR(255) NOT NULL,
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    status dataset_status NOT NULL DEFAULT 'pending'::dataset_status,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
@@ -38,13 +47,13 @@ CREATE TABLE IF NOT EXISTS asset_versions (
 
 -- 4. Initial Backfill from legacy tables
 INSERT INTO assets (id, workspace_id, kind, title, original_filename, mime_type, status, created_at, updated_at)
-SELECT id, workspace_id, 'dataset'::asset_kind, title, original_filename, mime_type, status, created_at, updated_at
+SELECT id, workspace_id, 'dataset'::asset_kind, title, original_filename, mime_type, status::dataset_status, created_at, updated_at
 FROM datasets
 ON CONFLICT (id) DO NOTHING;
 --;;
 
 INSERT INTO assets (id, workspace_id, kind, title, original_filename, mime_type, status, created_at, updated_at)
-SELECT id, workspace_id, 'knowledge'::asset_kind, title, original_filename, mime_type, status, created_at, updated_at
+SELECT id, workspace_id, 'knowledge'::asset_kind, title, original_filename, mime_type, status::dataset_status, created_at, updated_at
 FROM knowledge_assets
 ON CONFLICT (id) DO NOTHING;
 --;;

@@ -91,12 +91,27 @@ class TabularParser:
             series = df[col]
             dtype = str(series.dtype)
             
-            # Basic stats
+            # Basic stats (safely calculate min/max even with mixed types)
             null_count = int(series.isnull().sum())
             distinct_count = int(series.nunique())
             
-            min_val = str(series.min()) if not series.isnull().all() and hasattr(series, 'min') else None
-            max_val = str(series.max()) if not series.isnull().all() and hasattr(series, 'max') else None
+            try:
+                min_val = str(series.min()) if not series.isnull().all() and hasattr(series, 'min') else None
+            except TypeError:
+                # Handle mixed types (e.g. float and str) by converting to string first for lexicographical min
+                try:
+                    min_val = str(series.dropna().astype(str).min())
+                except Exception:
+                    min_val = None
+
+            try:
+                max_val = str(series.max()) if not series.isnull().all() and hasattr(series, 'max') else None
+            except TypeError:
+                try:
+                    max_val = str(series.dropna().astype(str).max())
+                except Exception:
+                    max_val = None
+
             
             # Sample values (top 5 distinct non-null)
             samples = series.dropna().unique()[:5].tolist()

@@ -64,8 +64,8 @@ class SqlAlchemyChatRepository(ChatRepository):
         if not chat_session:
             return None
         
-        # Sort messages by created_at explicitly just to be safe
-        sorted_msgs = sorted(chat_session.messages, key=lambda m: m.created_at)
+        # Sort messages by created_at explicitly just to be safe, handling None values
+        sorted_msgs = sorted(chat_session.messages, key=lambda m: m.created_at or datetime.min)
         messages = [
             ChatMessageRecord(
                 id=m.id,
@@ -106,6 +106,19 @@ class SqlAlchemyChatRepository(ChatRepository):
             )
             for s in sessions
         ]
+
+    async def delete_session(self, workspace_id: uuid.UUID, session_id: uuid.UUID) -> bool:
+        statement = select(ChatSession).where(
+            ChatSession.workspace_id == workspace_id,
+            ChatSession.id == session_id,
+        )
+        chat_session = await self._session.scalar(statement)
+        if not chat_session:
+            return False
+
+        await self._session.delete(chat_session)
+        await self._session.commit()
+        return True
 
     async def create_message(
         self, 

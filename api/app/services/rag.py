@@ -15,9 +15,11 @@ from sqlalchemy.orm import selectinload
 from api.app.core.config import Settings
 from api.app.models.entities import KnowledgeAsset, KnowledgeChunk, KnowledgeVersion
 from api.app.services.embedder import QueryEmbedder
-
+from api.app.services.model_aliases import normalize_model_name
 
 logger = logging.getLogger(__name__)
+
+NO_ANSWER_MESSAGE = "Tôi không tìm thấy thông tin phù hợp trong tài liệu của bạn để trả lời câu hỏi này."
 
 
 @dataclass
@@ -41,7 +43,7 @@ class RAGService:
     def _normalize_for_matching(self, value: str) -> str:
         normalized = unicodedata.normalize("NFD", value.casefold())
         normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
-        return normalized.replace("đ", "d")
+        return normalized.replace("\u0111", "d")
 
     async def retrieve_context(self, workspace_id: uuid.UUID, query: str) -> list[RetrievedContext]:
         query_embedding = await self._embedder.embed_query(query)
@@ -93,12 +95,11 @@ class RAGService:
 
     def _query_terms(self, query: str) -> set[str]:
         normalized = self._normalize_for_matching(query)
-        terms = {
+        return {
             term
             for term in re.findall(r"[\w]+", normalized, flags=re.UNICODE)
             if len(term) >= 4
         }
-        return terms
 
     def _lexical_score(self, query: str, context: RetrievedContext) -> float:
         terms = self._query_terms(query)
@@ -110,6 +111,7 @@ class RAGService:
                 context.content,
                 context.asset_title,
                 context.original_filename,
+                context.section_title or "",
             ]
         )
         haystack = self._normalize_for_matching(haystack)
@@ -164,44 +166,93 @@ class RAGService:
         citations: list[dict] = []
         seen_assets: set[uuid.UUID] = set()
 
-        for ctx in contexts:
-            if ctx.asset_id in seen_assets:
+        for context in contexts:
+            if context.asset_id in seen_assets:
                 continue
-            seen_assets.add(ctx.asset_id)
+
+            seen_assets.add(context.asset_id)
             citations.append(
                 {
-                    "asset_id": str(ctx.asset_id),
-                    "original_filename": ctx.original_filename,
-                    "chunk_id": str(ctx.chunk_id),
-                    "source_page": ctx.source_page,
-                    "quote": ctx.content[:200] + "...",
-                    "distance": ctx.distance,
+                    "asset_id": str(context.asset_id),
+                    "original_filename": context.original_filename,
+                    "chunk_id": str(context.chunk_id),
+                    "source_page": context.source_page,
+                    "quote": context.content[:200] + "...",
+                    "distance": context.distance,
                 }
             )
 
         return citations
 
-    def build_grounded_prompt(self, query: str, contexts: list[RetrievedContext]) -> str:
+    def build_grounded_prompt(self, query: str, contexts: list[RetrievedContext], model_name: str = "") -> str:
+        is_small_model = not model_name.startswith("gemini")
+        max_chunks = 3 if is_small_model else 5
+        max_content_len = 600 if is_small_model else 1200
+
         context_parts = []
-        for ctx in contexts:
-            page_info = f" (Page {ctx.source_page})" if ctx.source_page else ""
-            context_parts.append(f"--- Document: {ctx.original_filename}{page_info} ---\n{ctx.content}")
+        for index, context in enumerate(contexts[:max_chunks], start=1):
+            page_info = f" | Page {context.source_page}" if context.source_page else ""
+            section_info = f" | Section: {context.section_title}" if context.section_title else ""
+            content = context.content.strip()
+            if len(content) > max_content_len:
+                content = content[:max_content_len].rstrip() + "..."
+            context_parts.append(
+                f"[{index}] Document: {context.original_filename}{page_info}{section_info}\n{content}"
+            )
 
-        context_blocks = "\n\n".join(context_parts)
+        context_block = "\n\n".join(context_parts)
 
-        return f"""Bạn là một AI RAG hỗ trợ hỏi đáp trên tài liệu đã tải lên.
-Chỉ được trả lời dựa trên ngữ cảnh bên dưới.
-Nếu thông tin không có trong ngữ cảnh, hãy trả lời đúng câu:
-"Tôi không tìm thấy thông tin phù hợp trong tài liệu của bạn để trả lời câu hỏi này."
-Tuyệt đối không bịa thêm.
+        return f"""You are a retrieval QA assistant.
+Answer in Vietnamese.
 
-=== NGỮ CẢNH ===
-{context_blocks}
-================
+Rules:
+1. Use only the context below.
+2. If the answer is explicitly present in the context, answer directly and concisely.
+3. If the context includes times, dates, numbers, policies, or steps related to the question, include them exactly.
+4. If the answer is not in the context, reply with exactly:
+{NO_ANSWER_MESSAGE}
+5. Do not say the context is unrelated if it clearly contains the answer.
+6. Do not invent missing details.
 
-CÂU HỎI CỦA NGƯỜI DÙNG:
-{query}
-"""
+Context:
+{context_block}
+
+Question: {query}
+
+Answer:"""
+
+    def _history_window(self, model_name: str, history: list[dict]) -> list[dict]:
+        normalized_model = normalize_model_name(model_name)
+        if normalized_model.startswith("gemini"):
+            max_messages = 6
+            max_chars = 1600
+        else:
+            max_messages = 2
+            max_chars = 450
+
+        selected: list[dict] = []
+        total_chars = 0
+
+        for item in reversed(history):
+            role = item.get("role")
+            content = " ".join(str(item.get("content", "")).split())
+            if role not in {"user", "assistant"} or not content:
+                continue
+
+            if len(content) > 240:
+                content = content[:240].rstrip() + "..."
+
+            if total_chars + len(content) > max_chars:
+                break
+
+            selected.append({"role": role, "content": content})
+            total_chars += len(content)
+
+            if len(selected) >= max_messages:
+                break
+
+        selected.reverse()
+        return selected
 
     async def stream_generation(
         self,
@@ -210,10 +261,11 @@ CÂU HỎI CỦA NGƯỜI DÙNG:
         contexts: list[RetrievedContext],
         history: list[dict],
     ) -> AsyncGenerator[tuple[str, dict | None], None]:
-        if not contexts:
-            yield "Tôi không tìm thấy thông tin phù hợp trong tài liệu của bạn để trả lời câu hỏi này.", None
+        model_name = normalize_model_name(model_name)
 
-            citation_payload = {
+        if not contexts:
+            yield NO_ANSWER_MESSAGE, None
+            yield "", {
                 "citations": [],
                 "retrieval": {
                     "top_k": self._settings.rag_top_k,
@@ -222,14 +274,12 @@ CÂU HỎI CỦA NGƯỜI DÙNG:
                 "provider": {"name": "guardrail", "model": "none"},
                 "error": None,
             }
-            yield "", citation_payload
             return
 
-        prompt = self.build_grounded_prompt(query, contexts)
-
+        prompt = self.build_grounded_prompt(query, contexts, model_name=model_name)
         citations = self._build_citations(contexts)
-
-        messages = history + [{"role": "user", "content": prompt}]
+        message_history = self._history_window(model_name, history)
+        messages = message_history + [{"role": "user", "content": prompt}]
         emitted_token = False
 
         try:
@@ -238,17 +288,15 @@ CÂU HỎI CỦA NGƯỜI DÙNG:
                     emitted_token = True
                     yield token, None
                 provider = {"name": "gemini", "model": model_name}
-
-            elif model_name.startswith("llama") or model_name.startswith("gemma"):
-                async for token in self._stream_ollama(model_name, messages, self._settings.ollama_url):
+            elif model_name.startswith(("llama", "gemma")):
+                async for token in self._stream_ollama(model_name, messages):
                     emitted_token = True
                     yield token, None
                 provider = {"name": "ollama", "model": model_name}
-
             else:
                 raise ValueError(f"Unknown model identifier: {model_name}")
 
-            citation_payload = {
+            yield "", {
                 "citations": citations,
                 "retrieval": {
                     "top_k": self._settings.rag_top_k,
@@ -257,12 +305,10 @@ CÂU HỎI CỦA NGƯỜI DÙNG:
                 "provider": provider,
                 "error": None,
             }
-            yield "", citation_payload
-
         except Exception as exc:
             logger.exception("Generation provider failed for model %s", model_name)
             if not emitted_token:
-                yield f"Lỗi khi gọi model {model_name}: {exc}", None
+                yield f"Loi khi goi model {model_name}: {exc}", None
 
             yield "", {
                 "citations": citations,
@@ -278,9 +324,9 @@ CÂU HỎI CỦA NGƯỜI DÙNG:
         client = genai.Client(api_key=self._settings.gemini_api_key)
 
         gemini_messages = []
-        for msg in messages:
-            role = "user" if msg["role"] == "user" else "model"
-            gemini_messages.append({"role": role, "parts": [{"text": msg["content"]}]})
+        for message in messages:
+            role = "user" if message["role"] == "user" else "model"
+            gemini_messages.append({"role": role, "parts": [{"text": message["content"]}]})
 
         response = await client.aio.models.generate_content_stream(
             model=model_name,
@@ -291,15 +337,33 @@ CÂU HỎI CỦA NGƯỜI DÙNG:
                 yield chunk.text
 
     async def _stream_ollama(
-        self, model_name: str, messages: list[dict], url: str
+        self, model_name: str, messages: list[dict]
     ) -> AsyncGenerator[str, None]:
-        payload = {"model": model_name, "messages": messages, "stream": True}
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "stream": True,
+            "options": {"num_ctx": self._settings.ollama_num_ctx},
+        }
         async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream("POST", f"{url}/api/chat", json=payload) as response:
-                response.raise_for_status()
+            async with client.stream("POST", f"{self._settings.ollama_url}/api/chat", json=payload) as response:
+                await _raise_ollama_error(response, model_name)
                 async for line in response.aiter_lines():
                     if not line:
                         continue
                     chunk = json.loads(line)
                     if "message" in chunk and "content" in chunk["message"]:
                         yield chunk["message"]["content"]
+
+
+async def _raise_ollama_error(response: httpx.Response, model_name: str) -> None:
+    if response.status_code < 400:
+        return
+
+    body = await response.aread()
+    detail = body.decode("utf-8", errors="replace")
+    try:
+        detail = json.loads(detail).get("error", detail)
+    except json.JSONDecodeError:
+        pass
+    raise RuntimeError(f"Ollama model {model_name} failed: {detail}")

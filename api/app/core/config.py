@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     ollama_url: str = "http://127.0.0.1:11434"
     ollama_embed_model: str = "nomic-embed-text"
+    ollama_num_ctx: int = 4096
 
     @property
     def storage_local_path(self) -> str:
