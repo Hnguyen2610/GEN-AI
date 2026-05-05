@@ -162,14 +162,20 @@ class TextToSQLService:
                     attached[asset.id] = alias
 
             result = conn.execute(sql).df()
+            dataset_sources = _select_dataset_sources(sql, datasets)
             return {
                 "columns": result.columns.tolist(),
                 "rows": result.to_dict(orient="records"),
                 "sql_used": sql,
                 "row_count": len(result),
+                "dataset_sources": dataset_sources,
             }
         except Exception as exc:
-            return {"error": str(exc), "sql_used": sql}
+            return {
+                "error": str(exc),
+                "sql_used": sql,
+                "dataset_sources": _select_dataset_sources(sql, datasets),
+            }
         finally:
             conn.close()
 
@@ -197,12 +203,24 @@ class TextToSQLService:
             return
 
         is_gemini = model_name.startswith("gemini")
-        provider_name = "gemini" if is_gemini else "ollama"
+        # Groq/OpenRouter models usually start with llama, qwen, openai, deepseek etc.
+        is_groq = model_name.startswith(("llama", "qwen", "openai", "groq", "deepseek"))
+        
+        provider_name = "gemini" if is_gemini else ("groq" if is_groq else "ollama")
+        
         if is_gemini and not self._settings.gemini_api_key:
             yield "GEMINI_API_KEY chưa được cấu hình nên không thể sinh truy vấn SQL.", {
                 "provider": {"name": "guardrail", "model": "none"},
                 "route": "sql",
                 "error": "GEMINI_API_KEY is not configured",
+            }
+            return
+        
+        if is_groq and not self._settings.groq_api_key:
+            yield "GROQ_API_KEY chưa được cấu hình nên không thể sinh truy vấn SQL.", {
+                "provider": {"name": "guardrail", "model": "none"},
+                "route": "sql",
+                "error": "GROQ_API_KEY is not configured",
             }
             return
 
@@ -211,6 +229,8 @@ class TextToSQLService:
             if is_gemini:
                 client = genai.Client(api_key=self._settings.gemini_api_key)
                 sql_query = await self._generate_sql_gemini(client, chat_model, query, schema_context)
+            elif is_groq:
+                sql_query = await self._generate_sql_groq(chat_model, query, schema_context)
             else:
                 sql_query = await self._generate_sql_ollama(chat_model, query, schema_context)
         except Exception as e:
@@ -249,6 +269,8 @@ class TextToSQLService:
                 "provider": {"name": provider_name, "model": chat_model},
                 "route": "sql",
                 "sql_used": result.get("sql_used"),
+                "dataset_sources": result.get("dataset_sources", []),
+                "primary_sources": result.get("dataset_sources", []),
                 "error": result["error"],
                 "error_detail": detailed_error,
                 "error_stage": "sql_execution",
@@ -296,6 +318,36 @@ SQL:"""
             content = res.json()["message"]["content"]
             return self._extract_sql_from_response(content)
 
+    async def _generate_sql_groq(self, model_name: str, query: str, schema_context: str) -> str:
+        prompt = f"""Bạn là chuyên gia SQL. Hãy chuyển câu hỏi thành một truy vấn DuckDB an toàn.
+CHỈ TRẢ VỀ DUY NHẤT câu lệnh SQL trong block ```sql ... ```. 
+Không giải thích gì thêm.
+BẮT BUỘC sử dụng Schema Name (Ví dụ: `schema_name.table_name`).
+
+{schema_context}
+
+Câu hỏi người dùng: {query}
+SQL:"""
+        api_model_name = model_name.split("/")[-1] if "/" in model_name else model_name
+        payload = {
+            "model": api_model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": 0.0, # Deterministc SQL gen
+        }
+        headers = {
+            "Authorization": f"Bearer {self._settings.groq_api_key}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            res = await client.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers)
+            if res.status_code >= 400:
+                body = await res.aread()
+                raise RuntimeError(f"Groq SQL generation failed: {res.status_code} - {body.decode()}")
+            
+            content = res.json()["choices"][0]["message"]["content"]
+            return self._extract_sql_from_response(content)
+
     async def _explain_result(
         self,
         provider_name: str,
@@ -331,6 +383,37 @@ Kết quả tối đa 10 dòng đầu:
                 async for chunk in response:
                     if chunk.text:
                         yield chunk.text, None
+            elif provider_name == "groq":
+                api_model_name = model_name.split("/")[-1] if "/" in model_name else model_name
+                payload = {
+                    "model": api_model_name,
+                    "messages": [{"role": "user", "content": explanation_prompt}],
+                    "stream": True,
+                    "temperature": 0.7,
+                }
+                headers = {
+                    "Authorization": f"Bearer {self._settings.groq_api_key}",
+                    "Content-Type": "application/json"
+                }
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers) as response:
+                        if response.status_code >= 400:
+                            body = await response.aread()
+                            raise RuntimeError(f"Groq explanation failed: {response.status_code} - {body.decode()}")
+                        
+                        async for line in response.aiter_lines():
+                            if not line: continue
+                            line = line.strip()
+                            if line.startswith("data: "): line = line[6:]
+                            if line == "[DONE]": break
+                            if line:
+                                try:
+                                    chunk = json.loads(line)
+                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                    if "content" in delta and delta["content"]:
+                                        yield delta["content"], None
+                                except json.JSONDecodeError:
+                                    pass
             else:
                 payload = {
                     "model": model_name,
@@ -356,6 +439,8 @@ Kết quả tối đa 10 dòng đầu:
             "provider": {"name": provider_name, "model": model_name},
             "route": "sql",
             "sql_used": sql_used,
+            "dataset_sources": result.get("dataset_sources", []),
+            "primary_sources": result.get("dataset_sources", []),
             "row_count": result["row_count"],
             "data_preview": rows[:5],
             "error": None,
@@ -387,6 +472,43 @@ def _sanitize_alias(name: str) -> str:
     base = os.path.splitext(name)[0]
     sanitized = re.sub(r"[^A-Za-z0-9_]", "_", base).lower().strip("_")
     return sanitized if sanitized else "dataset"
+
+
+def _select_dataset_sources(sql: str, datasets: list[Asset]) -> list[dict[str, Any]]:
+    matched_sources: list[dict[str, Any]] = []
+    normalized_sql = sql or ""
+
+    for asset in datasets:
+        alias = _sanitize_alias(asset.title)
+        pattern = rf'(?<![A-Za-z0-9_])"?{re.escape(alias)}"?\s*\.'
+        if not re.search(pattern, normalized_sql, flags=re.IGNORECASE):
+            continue
+        matched_sources.append(
+            {
+                "kind": "dataset",
+                "asset_id": str(asset.id),
+                "title": asset.title,
+                "original_filename": asset.original_filename,
+                "schema_name": alias,
+            }
+        )
+
+    if matched_sources:
+        return matched_sources
+
+    if len(datasets) == 1:
+        asset = datasets[0]
+        return [
+            {
+                "kind": "dataset",
+                "asset_id": str(asset.id),
+                "title": asset.title,
+                "original_filename": asset.original_filename,
+                "schema_name": _sanitize_alias(asset.title),
+            }
+        ]
+
+    return []
 
 
 def _is_retryable_gemini_error(exc: Exception) -> bool:

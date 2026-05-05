@@ -11,23 +11,36 @@ import {
   type ChatMessage,
   type ChatSession,
 } from "../../../lib/api/client";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 const MODELS = [
-  { id: "llama3.2:1b", name: "Llama 3.2 (1B)" },
-  { id: "gemma", name: "Gemma Default" },
-  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash" },
+  { id: "llama-3.3-70b-versatile", name: "Llama 3.3 70B (Cloud)" },
+  { id: "gemini-2.5-flash", name: "Gemini 2.5 Flash (Cloud)" },
+  { id: "gemma", name: "Gemma (Ollama Local)" },
 ];
 
 type ChatMeta = Record<string, any> | null | undefined;
+type RuntimeFlagTone =
+  | "accent"
+  | "success"
+  | "warning"
+  | "danger"
+  | "muted";
+
+type RuntimeFlag = {
+  label: string;
+  tone: RuntimeFlagTone;
+};
+
+const AGENT_ACTIVITY_LINE_RE =
+  /^\s*>\s*AI\s+(?:dang\s+)?suy\s+luan:\s*(.+?)\s*$/i;
 
 function normalizeModelId(modelId: string): string {
-  if (
-    modelId === "gemini-1.5-flash" ||
-    modelId === "gemini-1.5-flash-latest"
-  ) {
+  if (modelId === "gemini-1.5-flash" || modelId === "gemini-1.5-flash-latest") {
     return "gemini-2.5-flash";
   }
 
@@ -49,7 +62,10 @@ function getDisplayModelName(modelId?: string | null): string {
   return normalized;
 }
 
-function getResponseModelName(message: ChatMessage | null, meta: ChatMeta): string {
+function getResponseModelName(
+  message: ChatMessage | null,
+  meta: ChatMeta,
+): string {
   const providerModel = meta?.provider?.model;
   if (providerModel) {
     return getDisplayModelName(providerModel);
@@ -57,11 +73,34 @@ function getResponseModelName(message: ChatMessage | null, meta: ChatMeta): stri
   return getDisplayModelName(message?.model_name);
 }
 
+function getFriendlyErrorMessage(error: string): string {
+  const normalized = error.toLowerCase();
+  if (
+    normalized.includes("429") ||
+    normalized.includes("resource_exhausted") ||
+    normalized.includes("quota") ||
+    normalized.includes("rate limit")
+  ) {
+    const base =
+      "Hệ thống đang tạm thời quá tải hoặc bạn đã hết hạn mức (Quota) của model này.";
+
+    // Try to extract retry time for Gemini
+    const retryMatch = error.match(/retry in ([\d\.]+)s/i);
+    if (retryMatch) {
+      return `${base} Vui lòng thử lại sau khoảng ${Math.ceil(parseFloat(retryMatch[1]))} giây nữa nhé.`;
+    }
+
+    return `${base} Vui lòng thử lại sau ít phút hoặc thử đổi sang sử dụng model khác nhé.`;
+  }
+  return error;
+}
+
 function getErrorDetail(meta: ChatMeta): string | null {
   if (!meta) {
     return null;
   }
-  return meta.error_detail ?? meta.error ?? null;
+  const rawError = meta.error_detail ?? meta.error ?? null;
+  return rawError ? getFriendlyErrorMessage(rawError) : null;
 }
 
 function formatConfidence(value: unknown): string {
@@ -88,47 +127,182 @@ function formatValue(value: unknown): string {
   }
 }
 
-function hasProcessContent(meta: ChatMeta): boolean {
+function didPevRun(meta: ChatMeta): boolean {
+  if (!meta) {
+    return false;
+  }
+
   return Boolean(
-    meta &&
-      (
-        meta.route ||
-        meta.provider ||
-        meta.route_reason ||
-        meta.route_confidence !== undefined ||
-        meta.sql_used ||
-        meta.error ||
-        meta.error_detail ||
-        meta.agent_traces?.length ||
-        meta.verification ||
-        meta.data_preview?.length
-      ),
+    meta.route === "agent" ||
+      meta.route === "agent_aborted" ||
+      meta.verification ||
+      meta.agent_traces?.length,
   );
 }
 
-function renderCitations(meta: ChatMeta) {
-  if (!meta?.citations?.length) {
+function getRuntimeFlags(meta: ChatMeta): RuntimeFlag[] {
+  const flags: RuntimeFlag[] = [];
+  if (!didPevRun(meta)) {
+    if (meta?.route === "sql") {
+      flags.push({ label: "Direct SQL", tone: "accent" });
+    } else if (meta?.route === "rag") {
+      flags.push({ label: "Direct RAG", tone: "accent" });
+    } else if (meta?.route === "chat") {
+      flags.push({ label: "Direct Chat", tone: "muted" });
+    } else if (meta?.route === "clarification") {
+      flags.push({ label: "Clarification", tone: "warning" });
+    }
+    return flags;
+  }
+
+  const verificationStatus = meta?.verification?.status;
+  const rawAttempts = Number(meta?.verification?.attempts ?? 0);
+  const attempts =
+    Number.isFinite(rawAttempts) && rawAttempts > 0
+      ? Math.floor(rawAttempts)
+      : 0;
+  const stepsTaken =
+    typeof meta?.steps_taken === "number" && meta.steps_taken > 0
+      ? Math.floor(meta.steps_taken)
+      : null;
+
+  if (meta?.route === "agent_aborted") {
+    flags.push({ label: "PEV Aborted", tone: "danger" });
+  } else if (verificationStatus === "passed" && attempts > 0) {
+    flags.push({ label: "PEV Self-Corrected", tone: "success" });
+  } else if (verificationStatus === "passed") {
+    flags.push({ label: "PEV Verified", tone: "success" });
+  } else if (verificationStatus === "insufficient_evidence") {
+    flags.push({ label: "PEV Safe Fallback", tone: "warning" });
+  } else if (verificationStatus === "needs_revision") {
+    flags.push({ label: "PEV Fallback", tone: "warning" });
+  } else if (verificationStatus === "skipped") {
+    flags.push({ label: "PEV Unverified", tone: "muted" });
+  } else {
+    flags.push({ label: "PEV Ran", tone: "accent" });
+  }
+
+  if (stepsTaken) {
+    flags.push({
+      label: `${stepsTaken} Step${stepsTaken === 1 ? "" : "s"}`,
+      tone: "muted",
+    });
+  }
+
+  if (attempts > 0) {
+    flags.push({
+      label: `${attempts} Revision${attempts === 1 ? "" : "s"}`,
+      tone: "accent",
+    });
+  }
+
+  return flags;
+}
+
+function hasProcessContent(meta: ChatMeta): boolean {
+  return Boolean(
+    meta &&
+    (meta.route ||
+      meta.provider ||
+      meta.route_reason ||
+      meta.route_confidence !== undefined ||
+      meta.sql_used ||
+      meta.error ||
+      meta.error_detail ||
+      meta.citations?.length ||
+      meta.dataset_sources?.length ||
+      meta.primary_sources?.length ||
+      meta.agent_traces?.length ||
+      meta.verification ||
+      meta.data_preview?.length),
+  );
+}
+
+function extractAgentActivity(content: string): {
+  displayContent: string;
+  activityLines: string[];
+} {
+  const activityLines: string[] = [];
+  const keptLines: string[] = [];
+
+  for (const line of content.split(/\r?\n/)) {
+    const matched = line.match(AGENT_ACTIVITY_LINE_RE);
+    if (matched) {
+      activityLines.push(matched[1].trim());
+      continue;
+    }
+    keptLines.push(line);
+  }
+
+  return {
+    displayContent: keptLines.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    activityLines,
+  };
+}
+
+function getDocumentSources(meta: ChatMeta): any[] {
+  if (!Array.isArray(meta?.citations)) {
+    return [];
+  }
+  return meta.citations;
+}
+
+function getDatasetSources(meta: ChatMeta): any[] {
+  if (!Array.isArray(meta?.dataset_sources)) {
+    return [];
+  }
+  return meta.dataset_sources;
+}
+
+function getPrimarySources(meta: ChatMeta): any[] {
+  if (Array.isArray(meta?.primary_sources) && meta.primary_sources.length > 0) {
+    return meta.primary_sources;
+  }
+  const datasetSources = getDatasetSources(meta);
+  if (datasetSources.length > 0) {
+    return datasetSources;
+  }
+  return getDocumentSources(meta);
+}
+
+function renderSourceBadges(sources: any[]) {
+  if (!sources.length) {
     return null;
   }
 
   return (
     <div className="chatjvb-citations">
-      {meta.citations.map((citation: any, index: number) => (
-        <div
-          key={`${citation.chunk_id ?? citation.original_filename ?? "citation"}-${index}`}
-          className="chatjvb-badge"
-          title={citation.quote}
-        >
-          {"DOC "}
-          {citation.original_filename}
-          {citation.source_page ? ` (p.${citation.source_page})` : ""}
-        </div>
-      ))}
+      {sources.map((source: any, index: number) => {
+        const isDataset = source.kind === "dataset";
+        const label = isDataset ? "DATASET " : "DOC ";
+        const filename =
+          source.original_filename ?? source.title ?? source.schema_name ?? "Unknown";
+        const suffix =
+          !isDataset && source.source_page ? ` (p.${source.source_page})` : "";
+        const keyBase =
+          source.asset_id ??
+          source.chunk_id ??
+          source.original_filename ??
+          source.title ??
+          "source";
+
+        return (
+          <div
+            key={`${keyBase}-${index}`}
+            className="chatjvb-badge"
+            title={source.quote}
+          >
+            {label}
+            {filename}
+            {suffix}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function ProcessPanel({
+function ProcessSnapshot({
   message,
   meta,
 }: {
@@ -143,95 +317,163 @@ function ProcessPanel({
   const errorDetail = getErrorDetail(meta);
   const route = meta?.route ?? "-";
   const providerName = meta?.provider?.name ?? "-";
+  const primarySources = getPrimarySources(meta);
 
   return (
-    <details className="chatjvb-process" open={Boolean(errorDetail)}>
-      <summary className="chatjvb-process-summary">Process</summary>
-      <div className="chatjvb-process-body">
-        <div className="chatjvb-process-grid">
-          <div className="chatjvb-process-row">
-            <span className="chatjvb-process-label">Model</span>
-            <span className="chatjvb-process-value">{modelName}</span>
-          </div>
-          <div className="chatjvb-process-row">
-            <span className="chatjvb-process-label">Provider</span>
-            <span className="chatjvb-process-value">{providerName}</span>
-          </div>
-          <div className="chatjvb-process-row">
-            <span className="chatjvb-process-label">Route</span>
-            <span className="chatjvb-process-value">{formatValue(route)}</span>
-          </div>
-          <div className="chatjvb-process-row">
-            <span className="chatjvb-process-label">Reason</span>
-            <span className="chatjvb-process-value">
-              {formatValue(meta?.route_reason)}
-            </span>
-          </div>
-          <div className="chatjvb-process-row">
-            <span className="chatjvb-process-label">Confidence</span>
-            <span className="chatjvb-process-value">
-              {formatConfidence(meta?.route_confidence)}
-            </span>
-          </div>
-          <div className="chatjvb-process-row">
-            <span className="chatjvb-process-label">Retrieval</span>
-            <span className="chatjvb-process-value">
-              {formatValue(meta?.retrieval_used ?? message?.retrieval_used)}
-            </span>
-          </div>
-          <div className="chatjvb-process-row">
-            <span className="chatjvb-process-label">Rows</span>
-            <span className="chatjvb-process-value">
-              {formatValue(meta?.row_count)}
-            </span>
-          </div>
-          <div className="chatjvb-process-row">
-            <span className="chatjvb-process-label">Error Stage</span>
-            <span className="chatjvb-process-value">
-              {formatValue(meta?.error_stage)}
-            </span>
+    <>
+      <div className="chatjvb-process-grid">
+        <div className="chatjvb-process-row">
+          <span className="chatjvb-process-label">Model</span>
+          <span className="chatjvb-process-value">{modelName}</span>
+        </div>
+        <div className="chatjvb-process-row">
+          <span className="chatjvb-process-label">Provider</span>
+          <span className="chatjvb-process-value">{providerName}</span>
+        </div>
+        <div className="chatjvb-process-row">
+          <span className="chatjvb-process-label">Route</span>
+          <span className="chatjvb-process-value">{formatValue(route)}</span>
+        </div>
+        <div className="chatjvb-process-row">
+          <span className="chatjvb-process-label">Reason</span>
+          <span className="chatjvb-process-value">
+            {formatValue(meta?.route_reason)}
+          </span>
+        </div>
+        <div className="chatjvb-process-row">
+          <span className="chatjvb-process-label">Confidence</span>
+          <span className="chatjvb-process-value">
+            {formatConfidence(meta?.route_confidence)}
+          </span>
+        </div>
+        <div className="chatjvb-process-row">
+          <span className="chatjvb-process-label">Retrieval</span>
+          <span className="chatjvb-process-value">
+            {formatValue(meta?.retrieval_used ?? message?.retrieval_used)}
+          </span>
+        </div>
+        <div className="chatjvb-process-row">
+          <span className="chatjvb-process-label">Rows</span>
+          <span className="chatjvb-process-value">
+            {formatValue(meta?.row_count)}
+          </span>
+        </div>
+        <div className="chatjvb-process-row">
+          <span className="chatjvb-process-label">Error Stage</span>
+          <span className="chatjvb-process-value">
+            {formatValue(meta?.error_stage)}
+          </span>
+        </div>
+      </div>
+
+      {meta?.sql_used ? (
+        <div className="chatjvb-process-section">
+          <div className="chatjvb-process-label">SQL</div>
+          <pre className="chatjvb-process-code">{meta.sql_used}</pre>
+        </div>
+      ) : null}
+
+      {primarySources.length > 0 ? (
+        <div className="chatjvb-process-section">
+          <div className="chatjvb-process-label">Primary Sources</div>
+          {renderSourceBadges(primarySources)}
+        </div>
+      ) : null}
+
+      {Array.isArray(meta?.agent_traces) && meta.agent_traces.length > 0 ? (
+        <div className="chatjvb-process-section">
+          <div className="chatjvb-process-label">Agent Steps</div>
+          <div className="chatjvb-process-traces">
+            {meta.agent_traces.map((trace: any, index: number) => (
+              <div
+                key={`${trace.tool ?? "tool"}-${index}`}
+                className="chatjvb-process-trace"
+              >
+                <strong>Step {trace.step ?? index + 1}</strong>
+                {`: ${trace.tool ?? "unknown"} (${trace.result ?? "unknown"})`}
+                {trace.args ? (
+                  <pre className="chatjvb-process-code small">
+                    {JSON.stringify(trace.args, null, 2)}
+                  </pre>
+                ) : null}
+              </div>
+            ))}
           </div>
         </div>
+      ) : null}
 
-        {meta?.sql_used ? (
-          <div className="chatjvb-process-section">
-            <div className="chatjvb-process-label">SQL</div>
-            <pre className="chatjvb-process-code">{meta.sql_used}</pre>
-          </div>
-        ) : null}
+      {meta?.verification ? (
+        <div className="chatjvb-process-section">
+          <div className="chatjvb-process-label">Verification</div>
+          <pre className="chatjvb-process-code small">
+            {JSON.stringify(meta.verification, null, 2)}
+          </pre>
+        </div>
+      ) : null}
 
-        {Array.isArray(meta?.agent_traces) && meta.agent_traces.length > 0 ? (
+      {errorDetail ? (
+        <div className="chatjvb-process-error">
+          <div className="chatjvb-process-label">Error Detail</div>
+          <div className="chatjvb-process-error-text">{errorDetail}</div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function ActivityPanel({
+  message,
+  meta,
+  activityLines,
+}: {
+  message: ChatMessage | null;
+  meta: ChatMeta;
+  activityLines: string[];
+}) {
+  const hasProcess = hasProcessContent(meta);
+  if (!activityLines.length && !hasProcess) {
+    return null;
+  }
+
+  const summaryLabel = activityLines.length > 0 ? "AI suy luan" : "Process";
+  const summaryMeta =
+    activityLines.length > 0
+      ? `${activityLines.length} update${activityLines.length === 1 ? "" : "s"}`
+      : "Details";
+  const shouldOpen =
+    message?.status === "streaming" &&
+    activityLines.length > 0 &&
+    !meta?.verification;
+
+  return (
+    <details className="chatjvb-process" open={shouldOpen}>
+      <summary className="chatjvb-process-summary">
+        <span>{summaryLabel}</span>
+        <span className="chatjvb-process-summary-meta">{summaryMeta}</span>
+      </summary>
+      <div className="chatjvb-process-body">
+        {activityLines.length > 0 ? (
           <div className="chatjvb-process-section">
-            <div className="chatjvb-process-label">Agent Steps</div>
-            <div className="chatjvb-process-traces">
-              {meta.agent_traces.map((trace: any, index: number) => (
-                <div key={`${trace.tool ?? "tool"}-${index}`} className="chatjvb-process-trace">
-                  <strong>Step {trace.step ?? index + 1}</strong>
-                  {`: ${trace.tool ?? "unknown"} (${trace.result ?? "unknown"})`}
-                  {trace.args ? (
-                    <pre className="chatjvb-process-code small">
-                      {JSON.stringify(trace.args, null, 2)}
-                    </pre>
-                  ) : null}
+            <div className="chatjvb-process-label">Tool Activity</div>
+            <div className="chatjvb-agent-activity-list">
+              {activityLines.map((line, index) => (
+                <div
+                  key={`${line}-${index}`}
+                  className="chatjvb-agent-activity-item"
+                >
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {line}
+                  </ReactMarkdown>
                 </div>
               ))}
             </div>
           </div>
         ) : null}
 
-        {meta?.verification ? (
+        {hasProcess ? (
           <div className="chatjvb-process-section">
-            <div className="chatjvb-process-label">Verification</div>
-            <pre className="chatjvb-process-code small">
-              {JSON.stringify(meta.verification, null, 2)}
-            </pre>
-          </div>
-        ) : null}
-
-        {errorDetail ? (
-          <div className="chatjvb-process-error">
-            <div className="chatjvb-process-label">Error Detail</div>
-            <div className="chatjvb-process-error-text">{errorDetail}</div>
+            <div className="chatjvb-process-label">Process</div>
+            <ProcessSnapshot message={message} meta={meta} />
           </div>
         ) : null}
       </div>
@@ -250,6 +492,8 @@ function AssistantResponse({
 }) {
   const modelName = getResponseModelName(message, meta);
   const errorDetail = getErrorDetail(meta);
+  const runtimeFlags = getRuntimeFlags(meta);
+  const { displayContent, activityLines } = extractAgentActivity(content);
 
   return (
     <div className="chatjvb-assistant-msg">
@@ -269,14 +513,35 @@ function AssistantResponse({
           <line x1="12" y1="22.08" x2="12" y2="12"></line>
         </svg>
       </div>
-      <div style={{ flex: 1 }}>
-        <div>{content}</div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {displayContent ? (
+          <div className="chatjvb-markdown">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {displayContent}
+            </ReactMarkdown>
+          </div>
+        ) : null}
         <div className="chatjvb-model-meta">Model: {modelName}</div>
+        {runtimeFlags.length > 0 ? (
+          <div className="chatjvb-runtime-flags">
+            {runtimeFlags.map((flag, index) => (
+              <div
+                key={`${flag.label}-${index}`}
+                className={`chatjvb-runtime-flag chatjvb-runtime-flag--${flag.tone}`}
+              >
+                {flag.label}
+              </div>
+            ))}
+          </div>
+        ) : null}
         {errorDetail ? (
           <div className="chatjvb-inline-error">{errorDetail}</div>
         ) : null}
-        {renderCitations(meta)}
-        <ProcessPanel message={message} meta={meta} />
+        <ActivityPanel
+          message={message}
+          meta={meta}
+          activityLines={activityLines}
+        />
       </div>
     </div>
   );
@@ -284,12 +549,16 @@ function AssistantResponse({
 
 export default function ChatView() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [currentSession, setCurrentSession] = useState<ChatSession | null>(null);
+  const [currentSession, setCurrentSession] = useState<ChatSession | null>(
+    null,
+  );
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [model, setModel] = useState(() => normalizeModelId(MODELS[0].id));
   const [loading, setLoading] = useState(false);
-  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(
+    null,
+  );
   const [streamingToken, setStreamingToken] = useState("");
   const [streamingMeta, setStreamingMeta] = useState<ChatMeta>(null);
 
@@ -339,7 +608,17 @@ export default function ChatView() {
     try {
       const session = await getChatSession(id);
       setCurrentSession(session);
-      setMessages(session.messages || []);
+
+      const sortedMessages = (session.messages || []).sort((a, b) => {
+        const diff =
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+        if (diff !== 0) return diff;
+        if (a.role === "user" && b.role !== "user") return -1;
+        if (a.role !== "user" && b.role === "user") return 1;
+        return 0;
+      });
+
+      setMessages(sortedMessages);
       setStreamingToken("");
       setStreamingMeta(null);
     } catch {
@@ -364,7 +643,9 @@ export default function ChatView() {
     try {
       await deleteChatSession(sessionId);
 
-      const remainingSessions = sessions.filter((session) => session.id !== sessionId);
+      const remainingSessions = sessions.filter(
+        (session) => session.id !== sessionId,
+      );
       setSessions(remainingSessions);
 
       if (currentSession?.id === sessionId) {
@@ -463,8 +744,10 @@ export default function ChatView() {
 
             if (parsed.event === "error") {
               const detail = String(parsed.data);
-              setStreamingToken((current) =>
-                current || "The request failed before a complete response was produced.",
+              setStreamingToken(
+                (current) =>
+                  current ||
+                  "The request failed before a complete response was produced.",
               );
               setStreamingMeta({
                 route: "unknown",
@@ -490,7 +773,8 @@ export default function ChatView() {
         route: "unknown",
         provider: { name: "unknown", model },
         error: "Failed to send message.",
-        error_detail: "The browser request failed before a valid SSE response was received.",
+        error_detail:
+          "The browser request failed before a valid SSE response was received.",
       });
       setStreamingToken("Failed to send message.");
     } finally {
@@ -542,7 +826,10 @@ export default function ChatView() {
               <button
                 type="button"
                 className="chatjvb-session-delete"
-                disabled={deletingSessionId === session.id || (loading && currentSession?.id === session.id)}
+                disabled={
+                  deletingSessionId === session.id ||
+                  (loading && currentSession?.id === session.id)
+                }
                 onClick={(event) => {
                   event.stopPropagation();
                   void handleDeleteSession(session.id);
@@ -568,7 +855,9 @@ export default function ChatView() {
             <select
               className="chatjvb-model-select"
               value={model}
-              onChange={(event) => setModel(normalizeModelId(event.target.value))}
+              onChange={(event) =>
+                setModel(normalizeModelId(event.target.value))
+              }
             >
               {MODELS.map((entry) => (
                 <option key={entry.id} value={entry.id}>
@@ -627,7 +916,10 @@ export default function ChatView() {
               {loading && !streamingToken ? (
                 <div className="chatjvb-msg-row">
                   <div className="chatjvb-msg-content">
-                    <div className="chatjvb-assistant-msg" style={{ opacity: 0.5 }}>
+                    <div
+                      className="chatjvb-assistant-msg"
+                      style={{ opacity: 0.5 }}
+                    >
                       <div className="chatjvb-avatar ai">
                         <svg
                           width="18"

@@ -46,7 +46,12 @@ class GeneralChatService:
                     emitted_token = True
                     yield token, None
                 provider = {"name": "gemini", "model": model_name}
-            elif model_name.startswith(("llama", "gemma")):
+            elif model_name.startswith(("llama", "qwen", "openai", "groq", "deepseek")):
+                async for token in self._stream_groq(model_name, messages):
+                    emitted_token = True
+                    yield token, None
+                provider = {"name": "groq", "model": model_name}
+            elif model_name.startswith(("gemma",)):
                 async for token in self._stream_ollama(model_name, messages):
                     emitted_token = True
                     yield token, None
@@ -113,6 +118,51 @@ class GeneralChatService:
                     chunk = json.loads(line)
                     if "message" in chunk and "content" in chunk["message"]:
                         yield chunk["message"]["content"]
+
+    async def _stream_groq(
+        self, model_name: str, messages: list[dict]
+    ) -> AsyncGenerator[str, None]:
+        if not self._settings.groq_api_key:
+            raise ValueError("GROQ_API_KEY is not configured.")
+        
+        # Strip potential provider prefixes like groq/ or openai/ if needed, but Groq accepts some of them.
+        # Actually Groq expects exact IDs like llama-3.3-70b-versatile. Let's assume frontend passes correct ID.
+        api_model_name = model_name.split("/")[-1] if "/" in model_name else model_name
+        
+        payload = {
+            "model": api_model_name,
+            "messages": messages,
+            "stream": True,
+            "temperature": 0.7,
+            "max_tokens": 4096
+        }
+        headers = {
+            "Authorization": f"Bearer {self._settings.groq_api_key}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise RuntimeError(f"Groq API failed: {response.status_code} - {body.decode()}")
+                
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    line = line.strip()
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    if line == "[DONE]":
+                        break
+                    if line:
+                        try:
+                            chunk = json.loads(line)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            if "content" in delta and delta["content"]:
+                                yield delta["content"]
+                        except json.JSONDecodeError:
+                            pass
+
 
 
 GENERAL_CHAT_PROMPT = (

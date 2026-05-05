@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
-from api.app.services.sql import SQLSafetyError, TextToSQLService
+from api.app.services.sql import SQLSafetyError, TextToSQLService, _select_dataset_sources
 
 def test_sql_safety_check_valid():
     service = TextToSQLService(settings=MagicMock(), session=MagicMock())
@@ -53,7 +53,20 @@ async def test_text_to_sql_stream_generation_ollama_path_explains_without_gemini
     service._get_workspace_schema_context = AsyncMock(return_value=("Schema content", [dataset_asset]))
     service._generate_sql_ollama = AsyncMock(return_value="SELECT 1 AS a")
     service._execute_sql = MagicMock(
-        return_value={"rows": [{"a": 1}], "row_count": 1, "sql_used": "SELECT 1 AS a"}
+        return_value={
+            "rows": [{"a": 1}],
+            "row_count": 1,
+            "sql_used": "SELECT 1 AS a",
+            "dataset_sources": [
+                {
+                    "kind": "dataset",
+                    "asset_id": str(dataset_asset.id),
+                    "title": "sales",
+                    "original_filename": "sales.xlsx",
+                    "schema_name": "sales",
+                }
+            ],
+        }
     )
 
     class FakeStreamResponse:
@@ -88,7 +101,7 @@ async def test_text_to_sql_stream_generation_ollama_path_explains_without_gemini
 
     tokens = []
     metas = []
-    async for token, meta in service.stream_generation("llama3.2:1b", "show me sales", uuid4(), []):
+    async for token, meta in service.stream_generation("gemma", "show me sales", uuid4(), []):
         if token:
             tokens.append(token)
         if meta:
@@ -98,6 +111,31 @@ async def test_text_to_sql_stream_generation_ollama_path_explains_without_gemini
     assert any("Summary from Ollama" in token for token in tokens)
     assert metas[0]["provider"]["name"] == "ollama"
     assert metas[0]["sql_used"] == "SELECT 1 AS a"
+    assert metas[0]["dataset_sources"][0]["original_filename"] == "sales.xlsx"
+    assert metas[0]["primary_sources"][0]["kind"] == "dataset"
+
+
+def test_select_dataset_sources_matches_schema_alias():
+    dataset_asset = SimpleNamespace(
+        id=uuid4(),
+        title="sample_rag_test",
+        original_filename="sample_rag_test.xlsx",
+    )
+
+    sources = _select_dataset_sources(
+        'SELECT * FROM "sample_rag_test".customers',
+        [dataset_asset],
+    )
+
+    assert sources == [
+        {
+            "kind": "dataset",
+            "asset_id": str(dataset_asset.id),
+            "title": "sample_rag_test",
+            "original_filename": "sample_rag_test.xlsx",
+            "schema_name": "sample_rag_test",
+        }
+    ]
 
 
 @pytest.mark.anyio

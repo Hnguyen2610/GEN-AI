@@ -26,11 +26,26 @@ def mock_sql():
     sql.list_assets.return_value = [{"title": "Sales", "kind": "dataset"}]
     sql.get_workspace_schema_context.return_value = (
         "Schema content",
-        [SimpleNamespace(id=uuid4(), title="sales")],
+        [SimpleNamespace(id=uuid4(), title="sales", original_filename="sales.xlsx")],
     )
     sql.get_dataset_profile.return_value = {"schema": "Schema content"}
     sql.preview_rows.return_value = {"rows": [{"a": 1}], "row_count": 1}
-    sql.execute_readonly_sql = MagicMock(return_value={"rows": [{"a": 1}], "row_count": 1, "sql_used": "SELECT *"})
+    sql.execute_readonly_sql = MagicMock(
+        return_value={
+            "rows": [{"a": 1}],
+            "row_count": 1,
+            "sql_used": "SELECT *",
+            "dataset_sources": [
+                {
+                    "kind": "dataset",
+                    "asset_id": "asset-1",
+                    "title": "sales",
+                    "original_filename": "sales.xlsx",
+                    "schema_name": "sales",
+                }
+            ],
+        }
+    )
     return sql
 
 
@@ -68,6 +83,7 @@ async def test_run_duckdb_sql_tool(mock_rag, mock_sql):
 
     assert result["total_rows"] == 1
     assert result["data"][0]["a"] == 1
+    assert result["dataset_sources"][0]["original_filename"] == "sales.xlsx"
     mock_sql.execute_readonly_sql.assert_called_once()
     assert mock_sql.execute_readonly_sql.call_args.args[2] == registry._dataset_assets
 

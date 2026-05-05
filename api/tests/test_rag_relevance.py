@@ -63,6 +63,28 @@ def test_build_citations_deduplicates_by_asset():
     ]
 
 
+def test_build_primary_sources_prefers_document_that_matches_answer():
+    service = RAGService(Settings(auto_create_schema=False), embedder=None, session=None)
+    first = make_context(
+        content="Company overview and office rules.",
+        filename="docs1.docx",
+        distance=0.1,
+    )
+    second = make_context(
+        content="Premium members include Nguyen A, Tran B, Le C, Hoang E.",
+        filename="docs2.docx",
+        distance=0.2,
+    )
+
+    primary_sources = service._build_primary_sources(
+        "nhung thanh vien premium va standard gom nhung ai",
+        "Nguyen A, Tran B, Le C, Hoang E.",
+        [first, second],
+    )
+
+    assert [source["original_filename"] for source in primary_sources] == ["docs2.docx"]
+
+
 def test_build_grounded_prompt_requires_direct_answer_when_context_contains_answer():
     service = RAGService(Settings(auto_create_schema=False), embedder=None, session=None)
     context = make_context(

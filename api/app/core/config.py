@@ -33,9 +33,14 @@ class Settings(BaseSettings):
     rag_distance_margin: float = 0.08
     rag_max_citation_assets: int = 2
     gemini_api_key: str = ""
+    gemini_vision_api_key: str | None = None
     ollama_url: str = "http://127.0.0.1:11434"
     ollama_embed_model: str = "nomic-embed-text"
     ollama_num_ctx: int = 4096
+    groq_api_key: str = ""
+    agent_max_steps: int = 8
+    agent_verification_retries: int = 1
+    agent_enable_logic_verification: bool = True
 
     @property
     def storage_local_path(self) -> str:

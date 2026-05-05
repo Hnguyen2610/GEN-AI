@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 5
     job_batch_size: int = 1
     gemini_api_key: str = ""
+    gemini_vision_api_key: str | None = None
 
     @property
     def storage_local_path(self) -> str:

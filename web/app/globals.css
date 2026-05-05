@@ -431,6 +431,54 @@ textarea {
   color: #9ca3af;
 }
 
+.chatjvb-runtime-flags {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chatjvb-runtime-flag {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.chatjvb-runtime-flag--accent {
+  background: rgba(16, 163, 127, 0.14);
+  border-color: rgba(16, 163, 127, 0.3);
+  color: #a7f3d0;
+}
+
+.chatjvb-runtime-flag--success {
+  background: rgba(59, 130, 246, 0.16);
+  border-color: rgba(59, 130, 246, 0.32);
+  color: #bfdbfe;
+}
+
+.chatjvb-runtime-flag--warning {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(245, 158, 11, 0.28);
+  color: #fde68a;
+}
+
+.chatjvb-runtime-flag--danger {
+  background: rgba(239, 68, 68, 0.16);
+  border-color: rgba(239, 68, 68, 0.28);
+  color: #fecaca;
+}
+
+.chatjvb-runtime-flag--muted {
+  background: rgba(255,255,255,0.04);
+  border-color: rgba(255,255,255,0.08);
+  color: #d1d5db;
+}
+
 .chatjvb-inline-error {
   margin-top: 10px;
   border: 1px solid rgba(248, 113, 113, 0.28);
@@ -458,10 +506,20 @@ textarea {
   font-weight: 600;
   color: #d1d5db;
   user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .chatjvb-process-summary::-webkit-details-marker {
   display: none;
+}
+
+.chatjvb-process-summary-meta {
+  font-size: 0.74rem;
+  font-weight: 500;
+  color: #9ca3af;
 }
 
 .chatjvb-process-body {
@@ -529,6 +587,38 @@ textarea {
   background: rgba(255,255,255,0.03);
   border: 1px solid rgba(255,255,255,0.06);
   font-size: 0.82rem;
+}
+
+.chatjvb-agent-activity-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.chatjvb-agent-activity-item {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.06);
+  font-size: 0.82rem;
+  color: #f3f4f6;
+}
+
+.chatjvb-agent-activity-item > *:first-child {
+  margin-top: 0;
+}
+
+.chatjvb-agent-activity-item > *:last-child {
+  margin-bottom: 0;
+}
+
+.chatjvb-agent-activity-item code {
+  background: #171717;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-size: 0.76rem;
 }
 
 .chatjvb-process-error {
@@ -602,4 +692,95 @@ textarea {
   font-weight: 700;
   color: #ccc;
   letter-spacing: -0.02em;
+}
+
+/* Markdown styling */
+.chatjvb-markdown {
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+.chatjvb-markdown p {
+  margin: 0 0 12px 0;
+}
+
+.chatjvb-markdown p:last-child {
+  margin-bottom: 0;
+}
+
+.chatjvb-markdown ul,
+.chatjvb-markdown ol {
+  margin: 0 0 12px 0;
+  padding-left: 24px;
+}
+
+.chatjvb-markdown li {
+  margin-bottom: 4px;
+}
+
+.chatjvb-markdown pre {
+  background: #171717;
+  padding: 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+  border: 1px solid rgba(255,255,255,0.1);
+  margin: 12px 0;
+}
+
+.chatjvb-markdown code {
+  font-family: monospace;
+  background: rgba(255,255,255,0.1);
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+.chatjvb-markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+
+/* Premium Table Styles */
+.chatjvb-markdown table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 16px 0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  overflow: hidden;
+  font-size: 0.9rem;
+}
+
+.chatjvb-markdown th {
+  background: rgba(255, 255, 255, 0.05);
+  padding: 12px 16px;
+  text-align: left;
+  font-weight: 600;
+  color: #fff;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.chatjvb-markdown td {
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  color: #d1d5db;
+}
+
+.chatjvb-markdown tr:last-child td {
+  border-bottom: none;
+}
+
+.chatjvb-markdown tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.chatjvb-markdown tr:hover td {
+  background: rgba(255, 255, 255, 0.04);
+  color: #fff;
+}
+
+.chatjvb-markdown th:not(:last-child),
+.chatjvb-markdown td:not(:last-child) {
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
 }

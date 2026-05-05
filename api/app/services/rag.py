@@ -184,10 +184,64 @@ class RAGService:
 
         return citations
 
+    def _build_primary_sources(
+        self,
+        query: str,
+        answer: str,
+        contexts: list[RetrievedContext],
+    ) -> list[dict]:
+        if not contexts:
+            return []
+
+        query_terms = self._query_terms(query)
+        answer_terms = self._query_terms(answer)
+        candidates: dict[uuid.UUID, dict] = {}
+
+        for index, context in enumerate(contexts):
+            score = self._primary_source_score(query_terms, answer_terms, context)
+            current = candidates.get(context.asset_id)
+            if current is None or score > current["score"] or (
+                score == current["score"] and index < current["index"]
+            ):
+                candidates[context.asset_id] = {
+                    "score": score,
+                    "index": index,
+                    "context": context,
+                }
+
+        best = min(
+            candidates.values(),
+            key=lambda item: (
+                -item["score"][0],
+                -item["score"][1],
+                item["index"],
+            ),
+        )
+        return self._build_citations([best["context"]])
+
+    def _primary_source_score(
+        self,
+        query_terms: set[str],
+        answer_terms: set[str],
+        context: RetrievedContext,
+    ) -> tuple[int, int]:
+        haystack = " ".join(
+            [
+                context.content,
+                context.asset_title,
+                context.original_filename,
+                context.section_title or "",
+            ]
+        )
+        haystack = self._normalize_for_matching(haystack)
+        answer_matches = sum(1 for term in answer_terms if term in haystack)
+        query_matches = sum(1 for term in query_terms if term in haystack)
+        return answer_matches, query_matches
+
     def build_grounded_prompt(self, query: str, contexts: list[RetrievedContext], model_name: str = "") -> str:
         is_small_model = not model_name.startswith("gemini")
-        max_chunks = 3 if is_small_model else 5
-        max_content_len = 600 if is_small_model else 1200
+        max_chunks = 4 if is_small_model else 5
+        max_content_len = 1000 if is_small_model else 1500
 
         context_parts = []
         for index, context in enumerate(contexts[:max_chunks], start=1):
@@ -197,29 +251,24 @@ class RAGService:
             if len(content) > max_content_len:
                 content = content[:max_content_len].rstrip() + "..."
             context_parts.append(
-                f"[{index}] Document: {context.original_filename}{page_info}{section_info}\n{content}"
+                f"[{index}] {context.original_filename}{page_info}{section_info}\n{content}"
             )
 
         context_block = "\n\n".join(context_parts)
 
-        return f"""You are a retrieval QA assistant.
-Answer in Vietnamese.
-
-Rules:
-1. Use only the context below.
-2. If the answer is explicitly present in the context, answer directly and concisely.
-3. If the context includes times, dates, numbers, policies, or steps related to the question, include them exactly.
-4. If the answer is not in the context, reply with exactly:
-{NO_ANSWER_MESSAGE}
-5. Do not say the context is unrelated if it clearly contains the answer.
-6. Do not invent missing details.
-
-Context:
+        return f"""Dưới đây là phần TÀI LIỆU tham khảo:
 {context_block}
 
-Question: {query}
+---
+HƯỚNG DẪN TRẢ LỜI:
+1. Bạn là trợ lý AI chuyên nghiệp. Dựa vào TÀI LIỆU trên, hãy tìm câu trả lời cho Câu hỏi của người dùng.
+2. Trả lời chi tiết, dễ hiểu, giữ nguyên các thông tin chính xác như giờ giấc, ngày tháng.
+3. NẾU TÀI LIỆU KHÔNG chứa thông tin, bắt buộc hãy trả lời chính xác bằng câu sau: "{NO_ANSWER_MESSAGE}"
+4. Không tự bịa thông tin bên ngoài.
 
-Answer:"""
+Câu hỏi của người dùng: {query}
+
+Trả lời:"""
 
     def _history_window(self, model_name: str, history: list[dict]) -> list[dict]:
         normalized_model = normalize_model_name(model_name)
@@ -267,6 +316,7 @@ Answer:"""
             yield NO_ANSWER_MESSAGE, None
             yield "", {
                 "citations": [],
+                "primary_sources": [],
                 "retrieval": {
                     "top_k": self._settings.rag_top_k,
                     "distance_threshold": self._settings.rag_max_distance,
@@ -281,16 +331,25 @@ Answer:"""
         message_history = self._history_window(model_name, history)
         messages = message_history + [{"role": "user", "content": prompt}]
         emitted_token = False
+        final_answer = ""
 
         try:
             if model_name.startswith("gemini"):
                 async for token in self._stream_gemini(model_name, messages):
                     emitted_token = True
+                    final_answer += token
                     yield token, None
                 provider = {"name": "gemini", "model": model_name}
-            elif model_name.startswith(("llama", "gemma")):
+            elif model_name.startswith(("llama", "qwen", "openai", "groq", "deepseek")):
+                async for token in self._stream_groq(model_name, messages):
+                    emitted_token = True
+                    final_answer += token
+                    yield token, None
+                provider = {"name": "groq", "model": model_name}
+            elif model_name.startswith(("gemma",)):
                 async for token in self._stream_ollama(model_name, messages):
                     emitted_token = True
+                    final_answer += token
                     yield token, None
                 provider = {"name": "ollama", "model": model_name}
             else:
@@ -298,6 +357,7 @@ Answer:"""
 
             yield "", {
                 "citations": citations,
+                "primary_sources": self._build_primary_sources(query, final_answer, contexts),
                 "retrieval": {
                     "top_k": self._settings.rag_top_k,
                     "distance_threshold": self._settings.rag_max_distance,
@@ -312,6 +372,7 @@ Answer:"""
 
             yield "", {
                 "citations": citations,
+                "primary_sources": self._build_primary_sources(query, final_answer, contexts),
                 "retrieval": {
                     "top_k": self._settings.rag_top_k,
                     "distance_threshold": self._settings.rag_max_distance,
@@ -335,6 +396,48 @@ Answer:"""
         async for chunk in response:
             if chunk.text:
                 yield chunk.text
+
+    async def _stream_groq(
+        self, model_name: str, messages: list[dict]
+    ) -> AsyncGenerator[str, None]:
+        if not self._settings.groq_api_key:
+            raise ValueError("GROQ_API_KEY is not configured.")
+        
+        api_model_name = model_name.split("/")[-1] if "/" in model_name else model_name
+        
+        payload = {
+            "model": api_model_name,
+            "messages": messages,
+            "stream": True,
+            "temperature": 0.2,
+            "max_tokens": 4096
+        }
+        headers = {
+            "Authorization": f"Bearer {self._settings.groq_api_key}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", "https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise RuntimeError(f"Groq API failed: {response.status_code} - {body.decode()}")
+                
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    line = line.strip()
+                    if line.startswith("data: "):
+                        line = line[6:]
+                    if line == "[DONE]":
+                        break
+                    if line:
+                        try:
+                            chunk = json.loads(line)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            if "content" in delta and delta["content"]:
+                                yield delta["content"]
+                        except json.JSONDecodeError:
+                            pass
 
     async def _stream_ollama(
         self, model_name: str, messages: list[dict]

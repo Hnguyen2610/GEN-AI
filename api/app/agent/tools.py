@@ -81,6 +81,7 @@ class AgentToolRegistry:
             "total_rows": row_count,
             "data": rows[:50],
             "sql_used": result.get("sql_used"),
+            "dataset_sources": result.get("dataset_sources", []),
             "notice": "Results truncated to 50 rows if larger" if row_count > 50 else "",
         }
 

@@ -32,25 +32,35 @@ class RouterService:
         self._settings = settings
         self._session = session
 
-    async def _get_workspace_inventory(self, workspace_id: UUID) -> str:
+    async def _get_workspace_inventory(self, workspace_id: UUID) -> tuple[str, list[str]]:
+        """Return (inventory_text, list_of_asset_titles)."""
         statement = (
-            select(Asset.kind, func.count(Asset.id))
+            select(Asset)
             .where(
                 Asset.workspace_id == workspace_id,
                 cast(Asset.status, String) == DatasetStatus.ready.value,
             )
-            .group_by(Asset.kind)
+            .order_by(Asset.created_at.desc())
         )
+        assets = (await self._session.scalars(statement)).all()
 
-        result = await self._session.execute(statement)
         counts: dict[str, int] = {}
-        for kind, count in result.all():
-            counts[getattr(kind, "value", kind)] = count
+        asset_titles: list[str] = []
+        for asset in assets:
+            kind_val = getattr(asset.kind, "value", asset.kind)
+            counts[kind_val] = counts.get(kind_val, 0) + 1
+            asset_titles.append(f"{asset.title} [{kind_val}]")
 
-        return (
-            f"- Knowledge Assets (PDFs, TXTs, Documents): {counts.get(AssetKind.knowledge.value, 0)}\n"
-            f"- Dataset Assets (CSV, Excel Tables): {counts.get(AssetKind.dataset.value, 0)}\n"
-        )
+        lines = [
+            f"- Knowledge Assets (PDFs, TXTs, Documents): {counts.get(AssetKind.knowledge.value, 0)}",
+            f"- Dataset Assets (CSV, Excel Tables): {counts.get(AssetKind.dataset.value, 0)}",
+        ]
+        if asset_titles:
+            lines.append("\nAsset names:")
+            for title in asset_titles:
+                lines.append(f"  • {title}")
+
+        return "\n".join(lines), asset_titles
 
     async def decide_route(
         self,
@@ -58,7 +68,7 @@ class RouterService:
         query: str,
         model_name: str = "gemini-2.5-flash",
     ) -> RouteResult:
-        inventory_context = await self._get_workspace_inventory(workspace_id)
+        inventory_context, asset_titles = await self._get_workspace_inventory(workspace_id)
 
         fast_path = self._fast_path_route(query, inventory_context)
         if fast_path is not None:
@@ -66,8 +76,13 @@ class RouterService:
 
         model_name = normalize_model_name(model_name)
         is_gemini = model_name.startswith("gemini")
+        is_groq = model_name.startswith(("llama", "qwen", "openai", "groq", "deepseek"))
+        
         if is_gemini and not self._settings.gemini_api_key:
             return self._heuristic_route(query, inventory_context, "GEMINI_API_KEY not configured.")
+        
+        if is_groq and not self._settings.groq_api_key:
+            return self._heuristic_route(query, inventory_context, "GROQ_API_KEY not configured.")
 
         prompt = f"""You are an AI router for an internal asset Q&A system.
 Task: choose the best processing lane for the user question.
@@ -75,12 +90,12 @@ Task: choose the best processing lane for the user question.
 Available assets in this workspace:
 {inventory_context}
 
-Route rules:
-- "chat": greetings, thanks, casual conversation, or general world knowledge not tied to uploaded assets.
-- "rag": policies, rules, definitions, procedures, or content from uploaded PDF/DOCX/TXT/MD files.
-- "sql": calculations, aggregations, filters, counts, averages, max/min, or table analysis over CSV/Excel data.
-- "hybrid": the question needs both document context and dataset analysis, or lookup of tabular entities plus explanation.
-- "clarification": the request is too vague to execute safely.
+Route rules (pick the FIRST that fits):
+1. "chat"  – greetings, thanks, casual conversation, or general world-knowledge not tied to any uploaded asset.
+2. "hybrid" – the user wants to read, summarize, or query BOTH documents and datasets, or asks a vague question about the content of a file that might be an Excel dataset (e.g. "trong file X có gì").
+3. "rag"   – reading, summarizing, or understanding the *content* of an uploaded document (PDF, DOCX, TXT, MD). This includes company policies, rules, penalty calculations ("cách tính tiền phạt", "quy định", "chính sách"), meaning the AI just needs to read the text rules.
+4. "sql"   – ONLY for actual numerical data analysis over CSV/Excel databases (aggregations, counting, sum, average, doing math over rows). Do NOT use this for reading rule documents.
+5. "clarification" – the request is too vague to execute safely.
 
 Return JSON only in this exact shape:
 {{
@@ -94,6 +109,8 @@ User question: "{query}"
         try:
             if is_gemini:
                 data = await self._classify_gemini(model_name, prompt)
+            elif is_groq:
+                data = await self._classify_groq(model_name, prompt)
             else:
                 data = await self._classify_ollama(model_name, prompt)
 
@@ -136,6 +153,28 @@ User question: "{query}"
             content = res.json()["message"]["content"]
             return json.loads(_strip_json_markdown(content))
 
+    async def _classify_groq(self, model_name: str, prompt: str) -> dict:
+        api_model_name = model_name.split("/")[-1] if "/" in model_name else model_name
+        payload = {
+            "model": api_model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._settings.groq_api_key}",
+            "Content-Type": "application/json"
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            res = await client.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers)
+            if res.status_code >= 400:
+                body = await res.aread()
+                raise RuntimeError(f"Groq classification failed: {res.status_code} - {body.decode()}")
+            
+            content = res.json()["choices"][0]["message"]["content"]
+            return json.loads(_strip_json_markdown(content))
+
     def _fast_path_route(self, query: str, inventory_context: str) -> RouteResult | None:
         normalized_query = _normalize_text(query)
         has_dataset = "Dataset Assets (CSV, Excel Tables): 0" not in inventory_context
@@ -143,8 +182,30 @@ User question: "{query}"
 
         wants_sql = _contains_any(normalized_query, SQL_KEYWORDS)
         wants_rag = _contains_any(normalized_query, RAG_KEYWORDS)
+        wants_content_reading = _contains_any(normalized_query, CONTENT_READING_KEYWORDS)
         wants_general_chat = _contains_any(normalized_query, CHAT_KEYWORDS)
         wants_general_knowledge = _looks_like_general_knowledge(normalized_query)
+
+        # Content-reading intent logic
+        if wants_content_reading:
+            if has_dataset and not has_knowledge:
+                return RouteResult(
+                    route="hybrid",
+                    reason="Read intent on dataset only, using hybrid/agent.",
+                    confidence=0.90,
+                )
+            if has_dataset and has_knowledge:
+                return RouteResult(
+                    route="hybrid",
+                    reason="Read intent on mixed assets, using hybrid/agent.",
+                    confidence=0.90,
+                )
+            if has_knowledge:
+                return RouteResult(
+                    route="rag",
+                    reason="Read intent on knowledge assets only.",
+                    confidence=0.95,
+                )
 
         if wants_sql and wants_rag and has_dataset and has_knowledge:
             return RouteResult(
@@ -250,6 +311,42 @@ RAG_KEYWORDS = {
     "trong tai lieu",
     "trong file",
     "my document",
+    "cv",
+    "resume",
+    "ho so",
+    "ly lich",
+}
+
+# Keywords indicating the user wants to READ/UNDERSTAND content,
+# not perform numerical analysis. These override SQL routing.
+CONTENT_READING_KEYWORDS = {
+    "co gi",
+    "noi dung",
+    "tom tat",
+    "liet ke",
+    "giai thich",
+    "trong",
+    "noi gi",
+    "viet gi",
+    "cho biet",
+    "doc",
+    "xem",
+    "thong tin",
+    "chi tiet",
+    "mieu ta",
+    "mo ta",
+    "summarize",
+    "describe",
+    "explain",
+    "what is in",
+    "contents",
+    "cach tinh",
+    "quy dinh",
+    "chinh sach",
+    "luat",
+    "phat",
+    "tien phat",
+    "ky luat",
 }
 
 SQL_KEYWORDS = {
@@ -268,8 +365,6 @@ SQL_KEYWORDS = {
     "max",
     "min",
     "bao nhieu",
-    "cv",
-    "resume",
     "thong ke",
     "doanh thu",
     "so luong",

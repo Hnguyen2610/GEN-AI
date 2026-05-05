@@ -135,10 +135,9 @@ async def main() -> None:
     storage_reader = StorageReader(settings)
     tabular_parser = TabularParser(storage_root=settings.storage_local_path)
     knowledge_parser = KnowledgeParser(
-        gemini_api_key=settings.gemini_api_key,
+        gemini_api_key=settings.gemini_vision_api_key or settings.gemini_api_key,
         ollama_url=settings.ollama_url,
         ollama_embed_model=settings.ollama_embed_model,
-        gemini_embed_model=settings.gemini_embed_model,
     )
 
     while True:
@@ -163,5 +162,6 @@ async def main() -> None:
         await asyncio.sleep(settings.poll_interval_seconds)
 
 
+# Triggering hot-reload to pick up new .env variables
 if __name__ == "__main__":
     asyncio.run(main())
